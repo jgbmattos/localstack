@@ -34,7 +34,7 @@ from localstack.services.awslambda.lambda_executors import (
     LAMBDA_RUNTIME_GOLANG,
     LAMBDA_RUNTIME_RUBY,
     LAMBDA_RUNTIME_RUBY25,
-    LAMBDA_RUNTIME_CUSTOM_RUNTIME)
+    LAMBDA_RUNTIME_PROVIDED)
 from localstack.utils.common import (to_str, load_file, save_file, TMP_FILES, ensure_readable,
     mkdir, unzip, is_zip_file, zip_contains_jar_entries, run, short_uid, timestamp,
     TIMESTAMP_FORMAT_MILLIS, md5, parse_chunked_data, now_utc, safe_requests,
@@ -58,10 +58,12 @@ LAMBDA_RUNTIMES = [LAMBDA_RUNTIME_PYTHON27, LAMBDA_RUNTIME_PYTHON36,
 LAMBDA_DEFAULT_TIMEOUT = 3
 # default handler and runtime
 LAMBDA_DEFAULT_HANDLER = 'handler.handler'
-LAMBDA_DEFAULT_RUNTIME = LAMBDA_RUNTIME_PYTHON27
+LAMBDA_DEFAULT_RUNTIME = LAMBDA_RUNTIME_PYTHON36
 LAMBDA_DEFAULT_STARTING_POSITION = 'LATEST'
 LAMBDA_ZIP_FILE_NAME = 'original_lambda_archive.zip'
 LAMBDA_JAR_FILE_NAME = 'original_lambda_archive.jar'
+
+DEFAULT_BATCH_SIZE = 10
 
 app = Flask(APP_NAME)
 
@@ -152,12 +154,14 @@ def add_function_mapping(lambda_name, lambda_handler, lambda_cwd=None):
     arn_to_lambda[arn].cwd = lambda_cwd
 
 
-def add_event_source(function_name, source_arn, enabled):
+def add_event_source(function_name, source_arn, enabled, batch_size=None):
+    batch_size = batch_size or DEFAULT_BATCH_SIZE
+
     mapping = {
         'UUID': str(uuid.uuid4()),
         'StateTransitionReason': 'User action',
         'LastModified': float(time.mktime(datetime.utcnow().timetuple())),
-        'BatchSize': 100,
+        'BatchSize': batch_size,
         'State': 'Enabled' if enabled is True or enabled is None else 'Disabled',
         'FunctionArn': func_arn(function_name),
         'EventSourceArn': source_arn,
@@ -223,44 +227,50 @@ def process_apigateway_invocation(func_arn, path, payload, headers={},
 
 
 def process_sns_notification(func_arn, topic_arn, subscriptionArn, message, message_attributes, subject='',):
-    try:
-        event = {
-            'Records': [{
-                'EventSource': 'localstack:sns',
-                'EventVersion': '1.0',
-                'EventSubscriptionArn': subscriptionArn,
-                'Sns': {
-                    'Type': 'Notification',
-                    'TopicArn': topic_arn,
-                    'Subject': subject,
-                    'Message': message,
-                    'Timestamp': timestamp(format=TIMESTAMP_FORMAT_MILLIS),
-                    'MessageAttributes': message_attributes
-                }
-            }]
-        }
-        return run_lambda(event=event, context={}, func_arn=func_arn, asynchronous=True)
-    except Exception as e:
-        LOG.warning('Unable to run Lambda function on SNS message: %s %s' % (e, traceback.format_exc()))
+    event = {
+        'Records': [{
+            'EventSource': 'localstack:sns',
+            'EventVersion': '1.0',
+            'EventSubscriptionArn': subscriptionArn,
+            'Sns': {
+                'Type': 'Notification',
+                'TopicArn': topic_arn,
+                'Subject': subject,
+                'Message': message,
+                'Timestamp': timestamp(format=TIMESTAMP_FORMAT_MILLIS),
+                'MessageAttributes': message_attributes
+            }
+        }]
+    }
+    return run_lambda(event=event, context={}, func_arn=func_arn, asynchronous=True)
 
 
 def process_kinesis_records(records, stream_name):
+    def chunks(lst, n):
+        # Yield successive n-sized chunks from lst.
+        for i in range(0, len(lst), n):
+            yield lst[i:i + n]
+
     # feed records into listening lambdas
     try:
         stream_arn = aws_stack.kinesis_stream_arn(stream_name)
         sources = get_event_sources(source_arn=stream_arn)
         for source in sources:
             arn = source['FunctionArn']
-            event = {
-                'Records': []
-            }
-            for rec in records:
-                event['Records'].append({
-                    'eventID': 'shardId-000000000000:{0}'.format(rec['sequenceNumber']),
-                    'eventSourceARN': stream_arn,
-                    'kinesis': rec
-                })
-            run_lambda(event=event, context={}, func_arn=arn)
+            for chunk in chunks(records, source['BatchSize']):
+                event = {
+                    'Records': [
+                        {
+                            'eventID': 'shardId-000000000000:{0}'.format(rec['sequenceNumber']),
+                            'eventSourceARN': stream_arn,
+                            'kinesis': rec
+                        }
+                        for rec in chunk
+                    ]
+                }
+
+                run_lambda(event=event, context={}, func_arn=arn)
+
     except Exception as e:
         LOG.warning('Unable to run Lambda function on Kinesis records: %s %s' % (e, traceback.format_exc()))
 
@@ -280,7 +290,7 @@ def process_sqs_message(message_body, message_attributes, queue_name, region_nam
             arn = source['FunctionArn']
             event = {'Records': [{
                 'body': message_body,
-                'receiptHandle': 'MessageReceiptHandle',
+                'receiptHandle': short_uid(),
                 'md5OfBody': md5(message_body),
                 'eventSourceARN': queue_arn,
                 'eventSource': 'aws:sqs',
@@ -376,7 +386,7 @@ def run_lambda(event, context, func_arn, version=None, suppress_output=False, as
             return not_found_error(msg='The resource specified in the request does not exist.')
         if not context:
             context = LambdaContext(func_details, version)
-        result, log_output = LAMBDA_EXECUTOR.execute(func_arn, func_details,
+        result = LAMBDA_EXECUTOR.execute(func_arn, func_details,
             event, context=context, version=version, asynchronous=asynchronous)
     except Exception as e:
         return error_response('Error executing Lambda function %s: %s %s' % (func_arn, e, traceback.format_exc()))
@@ -423,6 +433,8 @@ def exec_lambda_code(script, handler_function='handler', lambda_cwd=None, lambda
 
 def get_handler_file_from_name(handler_name, runtime=LAMBDA_DEFAULT_RUNTIME):
     # TODO: support Java Lambdas in the future
+    if runtime.startswith(LAMBDA_RUNTIME_PROVIDED):
+        return 'bootstrap'
     delimiter = '.'
     if runtime.startswith(LAMBDA_RUNTIME_NODEJS):
         file_ext = '.js'
@@ -433,8 +445,6 @@ def get_handler_file_from_name(handler_name, runtime=LAMBDA_DEFAULT_RUNTIME):
         delimiter = ':'
     elif runtime.startswith(LAMBDA_RUNTIME_RUBY):
         file_ext = '.rb'
-    elif runtime.startswith(LAMBDA_RUNTIME_CUSTOM_RUNTIME):
-        file_ext = '.sh'
     else:
         handler_name = handler_name.rpartition(delimiter)[0].replace(delimiter, os.path.sep)
         file_ext = '.py'
@@ -477,7 +487,7 @@ def get_zip_bytes(function_code):
     return zip_file_content
 
 
-def get_java_handler(zip_file_content, handler, main_file):
+def get_java_handler(zip_file_content, main_file, func_details=None):
     """Creates a Java handler from an uploaded ZIP or JAR.
 
     :type zip_file_content: bytes
@@ -491,8 +501,8 @@ def get_java_handler(zip_file_content, handler, main_file):
     """
     if is_zip_file(zip_file_content):
         def execute(event, context):
-            result, log_output = lambda_executors.EXECUTOR_LOCAL.execute_java_lambda(
-                event, context, handler=handler, main_file=main_file)
+            result = lambda_executors.EXECUTOR_LOCAL.execute_java_lambda(
+                event, context, main_file=main_file, func_details=func_details)
             return result
         return execute
     raise ClientError(error_response(
@@ -546,7 +556,7 @@ def set_function_code(code, lambda_name, lambda_cwd=None):
     lambda_details = arn_to_lambda[arn]
     runtime = lambda_details.runtime
     lambda_environment = lambda_details.envvars
-    handler_name = lambda_details.handler or LAMBDA_DEFAULT_HANDLER
+    handler_name = lambda_details.handler = lambda_details.handler or LAMBDA_DEFAULT_HANDLER
     code_passed = code
     code = code or lambda_details.code
     is_local_mount = code.get('S3Bucket') == BUCKET_MARKER_LOCAL
@@ -574,7 +584,7 @@ def set_function_code(code, lambda_name, lambda_cwd=None):
         # The Lambda executors for Docker subclass LambdaExecutorContainers, which
         # runs Lambda in Docker by passing all *.jar files in the function working
         # directory as part of the classpath. Obtain a Java handler function below.
-        lambda_handler = get_java_handler(zip_file_content, handler_name, tmp_file)
+        lambda_handler = get_java_handler(zip_file_content, tmp_file, func_details=lambda_details)
 
     if not is_local_mount:
         # Lambda code must be uploaded in Zip format
@@ -1134,7 +1144,9 @@ def create_event_source_mapping():
               in: body
     """
     data = json.loads(to_str(request.data))
-    mapping = add_event_source(data['FunctionName'], data['EventSourceArn'], data.get('Enabled'))
+    mapping = add_event_source(
+        data['FunctionName'], data['EventSourceArn'], data.get('Enabled'), data.get('BatchSize')
+    )
     return jsonify(mapping)
 
 

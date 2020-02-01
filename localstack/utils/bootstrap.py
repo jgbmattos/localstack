@@ -15,6 +15,7 @@ try:
 except Exception:
     import subprocess
 import six
+from datetime import datetime
 from localstack import constants, config
 
 # set up logger
@@ -22,6 +23,9 @@ LOG = logging.getLogger(os.path.basename(__file__))
 
 # maps plugin scope ("services", "commands") to flags which indicate whether plugins have been loaded
 PLUGINS_LOADED = {}
+
+# predefined list of plugin modules, to speed up the plugin loading at startup
+PLUGIN_MODULES = ['localstack', 'localstack_ext']
 
 # marker for extended/ignored libs in requirements.txt
 IGNORED_LIB_MARKER = '#extended-lib'
@@ -53,7 +57,8 @@ API_COMPOSITES = {
 # name of main Docker container
 MAIN_CONTAINER_NAME = 'localstack_main'
 
-# environment variable that indicates that we're executing in the context of the script that starts the Docker container
+# environment variable that indicates that we're executing in
+# the context of the script that starts the Docker container
 ENV_SCRIPT_STARTING_DOCKER = 'LS_SCRIPT_STARTING_DOCKER'
 
 # semaphore for locking access to Popen
@@ -127,17 +132,30 @@ def load_plugins(scope=None):
     if PLUGINS_LOADED.get(scope):
         return PLUGINS_LOADED[scope]
 
+    t1 = now_utc()
     setup_logging()
 
     loaded_files = []
     result = []
-    for module in pkgutil.iter_modules():
+
+    # Use a predefined list of plugin modules for now, to speed up the plugin loading at startup
+    # search_modules = pkgutil.iter_modules()
+    search_modules = PLUGIN_MODULES
+
+    for module in search_modules:
         file_path = None
-        if six.PY3 and not isinstance(module, tuple):
-            file_path = '%s/%s/plugins.py' % (module.module_finder.path, module.name)
+        if isinstance(module, six.string_types):
+            loader = pkgutil.get_loader(module)
+            if loader:
+                path = getattr(loader, 'path', '') or getattr(loader, 'filename', '')
+                if '__init__.py' in path:
+                    path = os.path.dirname(path)
+                file_path = os.path.join(path, 'plugins.py')
+        elif six.PY3 and not isinstance(module, tuple):
+            file_path = os.path.join(module.module_finder.path, module.name, 'plugins.py')
         elif six.PY3 or isinstance(module[0], pkgutil.ImpImporter):
             if hasattr(module[0], 'path'):
-                file_path = '%s/%s/plugins.py' % (module[0].path, module[1])
+                file_path = os.path.join(module[0].path, module[1], 'plugins.py')
         if file_path and file_path not in loaded_files:
             plugin_config = load_plugin_from_path(file_path, scope=scope)
             if plugin_config:
@@ -145,6 +163,12 @@ def load_plugins(scope=None):
             loaded_files.append(file_path)
     # set global flag
     PLUGINS_LOADED[scope] = result
+
+    # debug plugin loading time
+    load_time = now_utc() - t1
+    if load_time > 5:
+        LOG.debug('Plugin loading took %s sec' % load_time)
+
     return result
 
 
@@ -386,6 +410,10 @@ def start_infra_in_docker():
 # UTIL FUNCTIONS
 # ---------------
 
+def now_utc():
+    epoch = datetime.utcfromtimestamp(0)
+    return (datetime.utcnow() - epoch).total_seconds()
+
 
 def to_str(obj, errors='strict'):
     return obj.decode('utf-8', errors) if isinstance(obj, six.binary_type) else obj
@@ -425,8 +453,9 @@ class FuncThread(threading.Thread):
 def run(cmd, print_error=True, asynchronous=False, stdin=False,
         stderr=subprocess.STDOUT, outfile=None, env_vars=None, inherit_cwd=False,
         inherit_env=True, tty=False):
-    # don't use subprocess module inn Python 2 as it is not thread-safe
+    # don't use subprocess module in Python 2 as it is not thread-safe
     # http://stackoverflow.com/questions/21194380/is-subprocess-popen-not-thread-safe
+    # TODO: should be removed, now that Python 2 has reached its EOL
     if six.PY2:
         import subprocess32 as subprocess
     else:
@@ -435,6 +464,7 @@ def run(cmd, print_error=True, asynchronous=False, stdin=False,
     env_dict = os.environ.copy() if inherit_env else {}
     if env_vars:
         env_dict.update(env_vars)
+    env_dict = dict([(k, to_str(str(v))) for k, v in env_dict.items()])
 
     if tty:
         asynchronous = True
@@ -452,7 +482,7 @@ def run(cmd, print_error=True, asynchronous=False, stdin=False,
         # subprocess.Popen is not thread-safe, hence use a mutex here.. (TODO: mutex still needed?)
         with mutex_popen:
             stdin_arg = subprocess.PIPE if stdin else None
-            stdout_arg = open(outfile, 'wb') if isinstance(outfile, six.string_types) else outfile
+            stdout_arg = open(outfile, 'ab') if isinstance(outfile, six.string_types) else outfile
             stderr_arg = stderr
             if tty:
                 # Note: leave the "pty" import here (not supported in Windows)
