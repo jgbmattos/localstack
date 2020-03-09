@@ -5,18 +5,15 @@ import unittest
 
 from botocore.exceptions import ClientError
 
+from localstack.config import external_service_url
 from localstack.services.generic_proxy import ProxyListener
 from localstack.services.infra import start_proxy
-from localstack.config import external_service_url
+from localstack.services.sns.sns_listener import SUBSCRIPTION_STATUS
 from localstack.utils import testutil
 from localstack.utils.aws import aws_stack
 from localstack.utils.common import (
     to_str, get_free_tcp_port, retry, wait_for_port_open, get_service_protocol, short_uid, load_file
 )
-from localstack.services.infra import start_proxy
-from localstack.services.generic_proxy import ProxyListener
-from localstack.services.sns.sns_listener import SUBSCRIPTION_STATUS
-
 from .lambdas import lambda_integration
 from .test_lambda import TEST_LAMBDA_PYTHON, LAMBDA_RUNTIME_PYTHON36, TEST_LAMBDA_LIBS
 
