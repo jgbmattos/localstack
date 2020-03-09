@@ -110,7 +110,7 @@ def prefix_with_slash(s):
     return s if s[0] == '/' else '/%s' % s
 
 
-def get_event_message(event_name, bucket_name, file_name='testfile.txt', version_id=None, file_size=1024):
+def get_event_message(event_name, bucket_name, file_name='testfile.txt', version_id=None, file_size=0):
     # Based on: http://docs.aws.amazon.com/AmazonS3/latest/dev/notification-content-structure.html
     bucket_name = normalize_bucket_name(bucket_name)
     return {
@@ -182,16 +182,28 @@ def send_notifications(method, bucket_name, object_path, version_id):
 def send_notification_for_subscriber(notif, bucket_name, object_path, version_id, api_method, action, event_name):
     bucket_name = normalize_bucket_name(bucket_name)
 
-    if (not event_type_matches(notif['Event'], action, api_method) or
-            not filter_rules_match(notif.get('Filter'), object_path)):
+    if not event_type_matches(notif['Event'], action, api_method) or \
+            not filter_rules_match(notif.get('Filter'), object_path):
         return
-    # send notification
+
+    key = urlparse.unquote(object_path.replace('//', '/'))[1:]
+
+    s3_client = aws_stack.connect_to_service('s3')
+    try:
+        object_size = s3_client.head_object(Bucket=bucket_name, Key=key).get('ContentLength', 0)
+    except botocore.exceptions.ClientError:
+        object_size = 0
+
+    # build event message
     message = get_event_message(
-        event_name=event_name, bucket_name=bucket_name,
-        file_name=urlparse.urlparse(object_path[1:]).path,
+        event_name=event_name,
+        bucket_name=bucket_name,
+        file_name=key,
+        file_size=object_size,
         version_id=version_id
     )
     message = json.dumps(message)
+
     if notif.get('Queue'):
         sqs_client = aws_stack.connect_to_service('sqs')
         try:
@@ -430,7 +442,7 @@ def fix_etag_for_multipart(data, headers, response):
             correct_hash = md5(strip_chunk_signatures(data))
             tags = r'<ETag>%s</ETag>'
             pattern = r'(&#34;)?([^<&]+)(&#34;)?'
-            replacement = r'\1%s\3' % correct_hash
+            replacement = r'\g<1>%s\g<3>' % correct_hash
             response._content = re.sub(tags % pattern, tags % replacement, to_str(response.content))
             if response.headers.get('ETag'):
                 response.headers['ETag'] = re.sub(pattern, replacement, response.headers['ETag'])
@@ -802,9 +814,6 @@ class ProxyListenerS3(ProxyListener):
         if method == 'PUT' and not headers.get('content-type'):
             headers['content-type'] = 'binary/octet-stream'
 
-        # persist this API call to disk
-        persistence.record('s3', method, path, data, headers)
-
         # parse query params
         query = parsed_path.query
         path = parsed_path.path
@@ -893,6 +902,9 @@ class ProxyListenerS3(ProxyListener):
         method = to_str(method)
         bucket_name = get_bucket_name(path, headers)
 
+        # persist this API call to disk
+        persistence.record('s3', method, path, data, headers, response=response)
+
         # No path-name based bucket name? Try host-based
         hostname_parts = headers['host'].split('.')
         if (not bucket_name or len(bucket_name) == 0) and len(hostname_parts) > 1:
@@ -924,10 +936,10 @@ class ProxyListenerS3(ProxyListener):
 
         should_send_notifications = all([
             method in ('PUT', 'POST', 'DELETE'),
-            '/' in path[1:] or bucket_name_in_host,
+            '/' in path[1:] or bucket_name_in_host or key,
             # check if this is an actual put object request, because it could also be
             # a put bucket request with a path like this: /bucket_name/
-            bucket_name_in_host or (len(path[1:].split('/')) > 1 and len(path[1:].split('/')[1]) > 0),
+            bucket_name_in_host or key or (len(path[1:].split('/')) > 1 and len(path[1:].split('/')[1]) > 0),
             self.is_query_allowable(method, parsed.query)
         ])
 

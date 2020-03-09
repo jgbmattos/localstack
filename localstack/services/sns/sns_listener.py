@@ -13,8 +13,12 @@ from six.moves.urllib import parse as urlparse
 
 from localstack.config import external_service_url
 from localstack.constants import TEST_AWS_ACCOUNT_ID, MOTO_ACCOUNT_ID
+from localstack.utils.aws import aws_stack
+from localstack.utils.common import TIMESTAMP_FORMAT_MILLIS, short_uid, to_str, timestamp
+from localstack.utils.analytics import event_publisher
 from localstack.services.awslambda import lambda_api
 from localstack.services.generic_proxy import ProxyListener
+from localstack.utils.aws.aws_responses import response_regex_replace
 from localstack.utils.analytics import event_publisher
 from localstack.utils.aws import aws_stack
 from localstack.utils.aws.dead_letter_queue import sns_error_to_dead_letter_queue
@@ -22,6 +26,9 @@ from localstack.utils.common import short_uid, to_str, timestamp, TIMESTAMP_FORM
 
 # mappings for SNS topic subscriptions
 SNS_SUBSCRIPTIONS = {}
+
+# mappings for subscription status
+SUBSCRIPTION_STATUS = {}
 
 # mappings for SNS tags
 SNS_TAGS = {}
@@ -31,9 +38,7 @@ LOGGER = logging.getLogger(__name__)
 
 
 class ProxyListenerSNS(ProxyListener):
-
     def forward_request(self, method, path, data, headers):
-
         if method == 'OPTIONS':
             return 200
 
@@ -45,7 +50,6 @@ class ProxyListenerSNS(ProxyListener):
             return make_error(message=str(e), code=400)
 
         if method == 'POST' and path == '/':
-
             # parse payload and extract fields
             req_data = urlparse.parse_qs(to_str(data))
             req_action = req_data['Action'][0]
@@ -75,6 +79,12 @@ class ProxyListenerSNS(ProxyListener):
             elif req_action == 'Subscribe':
                 if 'Endpoint' not in req_data:
                     return make_error(message='Endpoint not specified in subscription', code=400)
+            elif req_action == 'ConfirmSubscription':
+                if 'TopicArn' not in req_data:
+                    return make_error(message='TopicArn not specified in confirm subscription request', code=400)
+                if 'Token' not in req_data:
+                    return make_error(message='Token not specified in confirm subscription request', code=400)
+                do_confirm_subscription(req_data.get('TopicArn')[0], req_data.get('Token')[0])
             elif req_action == 'Unsubscribe':
                 if 'SubscriptionArn' not in req_data:
                     return make_error(message='SubscriptionArn not specified in unsubscribe request', code=400)
@@ -139,11 +149,14 @@ class ProxyListenerSNS(ProxyListener):
             data, colon_delimiter='%3A', existing=TEST_AWS_ACCOUNT_ID, replace=MOTO_ACCOUNT_ID)
 
     def return_response(self, method, path, data, headers, response):
-
         if method == 'POST' and path == '/':
             # convert account IDs in ARNs
             data = aws_stack.fix_account_id_in_arns(data, colon_delimiter='%3A')
             aws_stack.fix_account_id_in_arns(response)
+
+            # remove "None" strings from result
+            search = r'<entry><key>[^<]+</key>\s*<value>\s*None\s*</[^>]+>\s*</entry>'
+            response_regex_replace(response, search, '')
 
             # parse request and extract data
             req_data = urlparse.parse_qs(to_str(data))
@@ -167,13 +180,17 @@ class ProxyListenerSNS(ProxyListener):
                 topic_arn = response_data['CreateTopicResponse']['CreateTopicResult']['TopicArn']
                 do_create_topic(topic_arn)
                 # publish event
-                event_publisher.fire_event(event_publisher.EVENT_SNS_CREATE_TOPIC,
-                    payload={'t': event_publisher.get_hash(topic_arn)})
+                event_publisher.fire_event(
+                    event_publisher.EVENT_SNS_CREATE_TOPIC,
+                    payload={'t': event_publisher.get_hash(topic_arn)}
+                )
             if req_action == 'DeleteTopic' and response.status_code < 400:
                 # publish event
                 topic_arn = (req_data.get('TargetArn') or req_data.get('TopicArn'))[0]
-                event_publisher.fire_event(event_publisher.EVENT_SNS_DELETE_TOPIC,
-                    payload={'t': event_publisher.get_hash(topic_arn)})
+                event_publisher.fire_event(
+                    event_publisher.EVENT_SNS_DELETE_TOPIC,
+                    payload={'t': event_publisher.get_hash(topic_arn)}
+                )
 
 
 # instantiate listener
@@ -267,6 +284,12 @@ def do_delete_topic(topic_arn):
     SNS_SUBSCRIPTIONS.pop(topic_arn, None)
 
 
+def do_confirm_subscription(topic_arn, token):
+    for k, v in SUBSCRIPTION_STATUS.items():
+        if v['Token'] == token and v['TopicArn'] == topic_arn:
+            v['Status'] = 'Subscribed'
+
+
 def do_subscribe(topic_arn, endpoint, protocol, subscription_arn, attributes, filter_policy=None):
     # An endpoint may only be subscribed to a topic once. Subsequent
     # subscribe calls do nothing (subscribe is idempotent).
@@ -285,6 +308,16 @@ def do_subscribe(topic_arn, endpoint, protocol, subscription_arn, attributes, fi
     subscription.update(attributes)
     SNS_SUBSCRIPTIONS[topic_arn].append(subscription)
 
+    if subscription_arn not in SUBSCRIPTION_STATUS.keys():
+        SUBSCRIPTION_STATUS[subscription_arn] = {}
+
+    SUBSCRIPTION_STATUS[subscription_arn].update(
+        {
+            'TopicArn': topic_arn,
+            'Token': short_uid(),
+            'Status': 'Not Subscribed'
+        }
+    )
     # Send out confirmation message for HTTP(S), fix for https://github.com/localstack/localstack/issues/881
     if protocol in ['http', 'https']:
         token = short_uid()
@@ -293,7 +326,7 @@ def do_subscribe(topic_arn, endpoint, protocol, subscription_arn, attributes, fi
             'Type': ['SubscriptionConfirmation'],
             'Token': [token],
             'Message': [('You have chosen to subscribe to the topic %s.\n' % topic_arn) +
-                'To confirm the subscription, visit the SubscribeURL included in this message.'],
+                        'To confirm the subscription, visit the SubscribeURL included in this message.'],
             'SubscribeURL': ['%s/?Action=ConfirmSubscription&TopicArn=%s&Token=%s' % (external_url, topic_arn, token)]
         }
         publish_message(topic_arn, confirmation, subscription_arn)
@@ -310,6 +343,7 @@ def do_unsubscribe(subscription_arn):
 def _get_tags(topic_arn):
     if topic_arn not in SNS_TAGS:
         SNS_TAGS[topic_arn] = []
+
     return SNS_TAGS[topic_arn]
 
 
@@ -318,11 +352,31 @@ def do_list_tags_for_resource(topic_arn):
 
 
 def do_tag_resource(topic_arn, tags):
-    _get_tags(topic_arn).extend(tags)
+    existing_tags = SNS_TAGS.get(topic_arn, [])
+    tags = [
+        tag for idx, tag in enumerate(tags)
+        if tag not in tags[:idx]
+    ]
+
+    def existing_tag_index(item):
+        for idx, tag in enumerate(existing_tags):
+            if item['Key'] == tag['Key']:
+                return idx
+        return None
+
+    for item in tags:
+        existing_index = existing_tag_index(item)
+        if existing_index is None:
+            existing_tags.append(item)
+        else:
+            existing_tags[existing_index] = item
+
+    SNS_TAGS[topic_arn] = existing_tags
 
 
 def do_untag_resource(topic_arn, tag_keys):
     SNS_TAGS[topic_arn] = [t for t in _get_tags(topic_arn) if t['Key'] not in tag_keys]
+
 
 # ---------------
 # HELPER METHODS
@@ -377,7 +431,7 @@ def create_sns_message_body(subscriber, req_data):
         # fix non-ascii unicode characters under Python 2
         message = message.encode('raw-unicode-escape')
 
-    if subscriber.get('RawMessageDelivery') in ('true', 'True', True):
+    if is_raw_message_delivery(subscriber):
         return message
 
     if req_data.get('MessageStructure') == ['json']:
@@ -387,37 +441,45 @@ def create_sns_message_body(subscriber, req_data):
         except KeyError:
             raise Exception("Unable to find 'default' key in message payload")
 
-    data = {}
-    data['MessageId'] = str(uuid.uuid4())
-    data['Type'] = req_data.get('Type', ['Notification'])[0]
-    data['Timestamp'] = timestamp(format=TIMESTAMP_FORMAT_MILLIS)
-    data['Message'] = message
-    data['TopicArn'] = subscriber['TopicArn']
+    data = {
+        'Type': req_data.get('Type', ['Notification'])[0],
+        'MessageId': str(uuid.uuid4()),
+        'Token': req_data.get('Token', [None])[0],
+        'TopicArn': subscriber['TopicArn'],
+        'Message': message,
+        'SubscribeURL': req_data.get('SubscribeURL', [None])[0],
+        'Timestamp': timestamp(format=TIMESTAMP_FORMAT_MILLIS),
+        'SignatureVersion': '1',
+        # TODO Add a more sophisticated solution with an actual signature
+        # Hardcoded
+        'Signature': 'EXAMPLEpH+..',
+        'SigningCertURL': 'https://sns.us-east-1.amazonaws.com/SimpleNotificationService-0000000000000000000000.pem'
+    }
+
     if subject is not None:
         data['Subject'] = subject
+
     attributes = get_message_attributes(req_data)
     if attributes:
         data['MessageAttributes'] = attributes
-    for attr in ['Token', 'SubscribeURL']:
-        value = req_data.get(attr, [None])[0]
-        if value:
-            data[attr] = value
-    result = json.dumps(data)
-    return result
+
+    return json.dumps(data)
 
 
 def create_sqs_message_attributes(subscriber, attributes):
-    if subscriber.get('RawMessageDelivery') not in ('true', True):
+    if not is_raw_message_delivery(subscriber):
         return {}
 
     message_attributes = {}
     for key, value in attributes.items():
-        attribute = {}
-        attribute['DataType'] = value['Type']
+        attribute = {
+            'DataType': value['Type']
+        }
         if value['Type'] == 'Binary':
             attribute['BinaryValue'] = value['Value']
         else:
             attribute['StringValue'] = str(value['Value'])
+
         message_attributes[key] = attribute
 
     return message_attributes
@@ -429,8 +491,9 @@ def get_message_attributes(req_data):
     while True:
         name = req_data.get('MessageAttributes.entry.' + str(x) + '.Name', [None])[0]
         if name is not None:
-            attribute = {}
-            attribute['Type'] = req_data.get('MessageAttributes.entry.' + str(x) + '.Value.DataType', [None])[0]
+            attribute = {
+                'Type': req_data.get('MessageAttributes.entry.' + str(x) + '.Value.DataType', [None])[0]
+            }
             string_value = req_data.get('MessageAttributes.entry.' + str(x) + '.Value.StringValue', [None])[0]
             binary_value = req_data.get('MessageAttributes.entry.' + str(x) + '.Value.BinaryValue', [None])[0]
             if string_value is not None:
@@ -539,3 +602,7 @@ def check_filter_policy(filter_policy, message_attributes):
             return False
 
     return True
+
+
+def is_raw_message_delivery(susbcriber):
+    return susbcriber.get('RawMessageDelivery') in ('true', True, 'True')

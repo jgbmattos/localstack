@@ -7,11 +7,16 @@ from botocore.exceptions import ClientError
 
 from localstack.services.generic_proxy import ProxyListener
 from localstack.services.infra import start_proxy
+from localstack.config import external_service_url
 from localstack.utils import testutil
 from localstack.utils.aws import aws_stack
 from localstack.utils.common import (
     to_str, get_free_tcp_port, retry, wait_for_port_open, get_service_protocol, short_uid, load_file
 )
+from localstack.services.infra import start_proxy
+from localstack.services.generic_proxy import ProxyListener
+from localstack.services.sns.sns_listener import SUBSCRIPTION_STATUS
+
 from .lambdas import lambda_integration
 from .test_lambda import TEST_LAMBDA_PYTHON, LAMBDA_RUNTIME_PYTHON36, TEST_LAMBDA_LIBS
 
@@ -66,8 +71,17 @@ class SNSTest(unittest.TestCase):
         self.sns_client.subscribe(TopicArn=self.topic_arn, Protocol='http', Endpoint=queue_arn)
 
         def received():
-            assert records[0][0]['Type'] == 'SubscriptionConfirmation'
-            assert records[0][1]['x-amz-sns-message-type'] == 'SubscriptionConfirmation'
+            self.assertEqual(records[0][0]['Type'], 'SubscriptionConfirmation')
+            self.assertEqual(records[0][1]['x-amz-sns-message-type'], 'SubscriptionConfirmation')
+
+            token = records[0][0]['Token']
+            subscribe_url = records[0][0]['SubscribeURL']
+
+            self.assertEqual(subscribe_url, '%s/?Action=ConfirmSubscription&TopicArn=%s&Token=%s' % (
+                external_service_url('sns'), self.topic_arn, token))
+
+            self.assertIn('Signature', records[0][0])
+            self.assertIn('SigningCertURL', records[0][0])
 
         retry(received, retries=5, sleep=1)
         proxy.stop()
@@ -167,10 +181,17 @@ class SNSTest(unittest.TestCase):
                     'Key': '456',
                     'Value': 'def'
                 },
+                {
+                    'Key': '456',
+                    'Value': 'def'
+                }
             ]
         )
 
         tags = self.sns_client.list_tags_for_resource(ResourceArn=self.topic_arn)
+        distinct_tags = [tag for idx, tag in enumerate(tags['Tags']) if tag not in tags['Tags'][:idx]]
+        # test for duplicate tags
+        self.assertEqual(len(tags['Tags']), len(distinct_tags))
         self.assertEqual(len(tags['Tags']), 2)
         self.assertEqual(tags['Tags'][0]['Key'], '123')
         self.assertEqual(tags['Tags'][0]['Value'], 'abc')
@@ -186,6 +207,38 @@ class SNSTest(unittest.TestCase):
         self.assertEqual(len(tags['Tags']), 1)
         self.assertEqual(tags['Tags'][0]['Key'], '456')
         self.assertEqual(tags['Tags'][0]['Value'], 'def')
+
+        self.sns_client.tag_resource(
+            ResourceArn=self.topic_arn,
+            Tags=[
+                {
+                    'Key': '456',
+                    'Value': 'pqr'
+                }
+            ]
+        )
+
+        tags = self.sns_client.list_tags_for_resource(ResourceArn=self.topic_arn)
+        self.assertEqual(len(tags['Tags']), 1)
+        self.assertEqual(tags['Tags'][0]['Key'], '456')
+        self.assertEqual(tags['Tags'][0]['Value'], 'pqr')
+
+    def test_topic_subscription(self):
+        subscription = self.sns_client.subscribe(
+            TopicArn=self.topic_arn,
+            Protocol='email',
+            Endpoint='localstack@yopmail.com'
+        )
+        subscription_arn = subscription['SubscriptionArn']
+        subscription_obj = SUBSCRIPTION_STATUS[subscription_arn]
+        self.assertEqual(subscription_obj['Status'], 'Not Subscribed')
+
+        _token = subscription_obj['Token']
+        self.sns_client.confirm_subscription(
+            TopicArn=self.topic_arn,
+            Token=_token
+        )
+        self.assertEqual(subscription_obj['Status'], 'Subscribed')
 
     def test_dead_letter_queue(self):
         lambda_name = 'test-%s' % short_uid()

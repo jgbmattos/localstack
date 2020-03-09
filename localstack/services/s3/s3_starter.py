@@ -1,17 +1,15 @@
-import sys
 import types
 import logging
 import traceback
 from moto.s3 import models as s3_models
 from moto.s3 import responses as s3_responses
-from moto.server import main as moto_main
+from moto.s3.responses import (
+    minidom, MalformedXML, undo_clean_key_name)
 from localstack import config
 from localstack.constants import DEFAULT_PORT_S3_BACKEND
 from localstack.utils.aws import aws_stack
 from localstack.utils.common import wait_for_port_open
-from localstack.services.infra import (
-    get_service_protocol, start_proxy_for_service, do_run)
-from localstack.utils.bootstrap import setup_logging
+from localstack.services.infra import start_moto_server
 
 LOG = logging.getLogger(__name__)
 
@@ -40,12 +38,11 @@ def check_s3(expect_shutdown=False, print_error=False):
 
 def start_s3(port=None, backend_port=None, asynchronous=None, update_listener=None):
     port = port or config.PORT_S3
-    backend_port = DEFAULT_PORT_S3_BACKEND
-    cmd = '%s "%s" s3 -p %s -H 0.0.0.0' % (sys.executable, __file__, backend_port)
-    print('Starting mock S3 (%s port %s)...' % (get_service_protocol(), port))
-    start_proxy_for_service('s3', port, backend_port, update_listener)
-    env_vars = {'PYTHONPATH': ':'.join(sys.path)}
-    return do_run(cmd, asynchronous, env_vars=env_vars)
+    backend_port = backend_port or DEFAULT_PORT_S3_BACKEND
+    apply_patches()
+    return start_moto_server(
+        key='s3', name='S3', asynchronous=asynchronous,
+        port=port, backend_port=backend_port, update_listener=update_listener)
 
 
 def apply_patches():
@@ -75,6 +72,18 @@ def apply_patches():
         acl = acl or TMP_STATE.pop(acl_key, None) or bucket.acl
         if acl:
             key.set_acl(acl)
+
+    # patch Bucket.create_from_cloudformation_json in moto
+
+    @classmethod
+    def Bucket_create_from_cloudformation_json(cls, resource_name, cloudformation_json, region_name):
+        result = create_from_cloudformation_json_orig(resource_name, cloudformation_json, region_name)
+        # remove the bucket from the backend, as our template_deployer will take care of creating the resource
+        s3_models.s3_backend.buckets.pop(resource_name)
+        return result
+
+    create_from_cloudformation_json_orig = s3_models.FakeBucket.create_from_cloudformation_json
+    s3_models.FakeBucket.create_from_cloudformation_json = Bucket_create_from_cloudformation_json
 
     # patch _key_response_post(..)
 
@@ -125,14 +134,62 @@ def apply_patches():
     s3_responses.S3ResponseInstance._truncate_result = types.MethodType(
         s3_truncate_result, s3_responses.S3ResponseInstance)
 
+    # patch _bucket_response_delete_keys(..)
+    # https://github.com/localstack/localstack/issues/2077
 
-def main():
-    setup_logging()
-    # patch moto implementation
-    apply_patches()
-    # start API
-    sys.exit(moto_main())
+    s3_delete_keys_response_template = """<?xml version="1.0" encoding="UTF-8"?>
+    <DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01">
+    {% for k in deleted %}
+    <Deleted>
+    <Key>{{k.key}}</Key>
+    <VersionId>{{k.version_id}}</VersionId>
+    </Deleted>
+    {% endfor %}
+    {% for k in delete_errors %}
+    <Error>
+    <Key>{{k}}</Key>
+    </Error>
+    {% endfor %}
+    </DeleteResult>"""
 
+    def s3_bucket_response_delete_keys(self, request, body, bucket_name):
+        template = self.response_template(s3_delete_keys_response_template)
 
-if __name__ == '__main__':
-    main()
+        elements = minidom.parseString(body).getElementsByTagName('Object')
+        if len(elements) == 0:
+            raise MalformedXML()
+
+        deleted_names = []
+        error_names = []
+
+        keys = []
+        for element in elements:
+            if len(element.getElementsByTagName('VersionId')) == 0:
+                version_id = None
+            else:
+                version_id = element.getElementsByTagName('VersionId')[0].firstChild.nodeValue
+
+            keys.append({
+                'key_name': element.getElementsByTagName('Key')[0].firstChild.nodeValue,
+                'version_id': version_id
+            })
+
+        for k in keys:
+            key_name = k['key_name']
+            version_id = k['version_id']
+            success = self.backend.delete_key(
+                bucket_name, undo_clean_key_name(key_name), version_id)
+
+            if success:
+                deleted_names.append({
+                    'key': key_name,
+                    'version_id': version_id
+                })
+            else:
+                error_names.append(key_name)
+
+        return (200, {},
+            template.render(deleted=deleted_names, delete_errors=error_names))
+
+    s3_responses.S3ResponseInstance._bucket_response_delete_keys = types.MethodType(
+        s3_bucket_response_delete_keys, s3_responses.S3ResponseInstance)

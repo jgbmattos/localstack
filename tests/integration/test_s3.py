@@ -16,6 +16,7 @@ from localstack.utils.common import (
 TEST_BUCKET_NAME_WITH_POLICY = 'test-bucket-policy-1'
 TEST_BUCKET_WITH_NOTIFICATION = 'test-bucket-notification-1'
 TEST_QUEUE_FOR_BUCKET_WITH_NOTIFICATION = 'test_queue_for_bucket_notification_1'
+TEST_BUCKET_WITH_VERSIONING = 'test-bucket-versioning-1'
 
 
 class PutRequest(Request):
@@ -373,6 +374,27 @@ class S3ListenerTest(unittest.TestCase):
         # clean up
         self._delete_bucket(bucket_name, [object_key])
 
+    def test_s3_post_object_on_presigned_post(self):
+        bucket_name = 'test-bucket-%s' % short_uid()
+        self.s3_client.create_bucket(Bucket=bucket_name)
+        body = 'something body'
+        # get presigned URL
+        object_key = 'test-presigned-post-key'
+        presigned_request = self.s3_client.generate_presigned_post(
+            Bucket=bucket_name,
+            Key=object_key
+        )
+        # put object
+        files = {'file': body}
+        response = requests.post(presigned_request['url'], data=presigned_request['fields'], files=files, verify=False)
+        self.assertEqual(response.status_code, 200)
+        # get object and compare results
+        downloaded_object = self.s3_client.get_object(Bucket=bucket_name, Key=object_key)
+        download_object = downloaded_object['Body'].read()
+        self.assertEqual(to_str(body), to_str(download_object))
+        # clean up
+        self._delete_bucket(bucket_name, [object_key])
+
     def test_s3_delete_response_content_length_zero(self):
         bucket_name = 'test-bucket-%s' % short_uid()
         self.s3_client.create_bucket(Bucket=bucket_name)
@@ -397,7 +419,7 @@ class S3ListenerTest(unittest.TestCase):
     def test_delete_object_tagging(self):
         bucket_name = 'test-%s' % short_uid()
         self.s3_client.create_bucket(Bucket=bucket_name, ACL='public-read')
-        object_key = 'test-key'
+        object_key = 'test-key-tagging'
         self.s3_client.put_object(Bucket=bucket_name, Key=object_key, Body='something')
         # get object and assert response
         url = '%s/%s/%s' % (config.TEST_S3_URL, bucket_name, object_key)
@@ -414,7 +436,7 @@ class S3ListenerTest(unittest.TestCase):
     def test_delete_non_existing_keys(self):
         bucket_name = 'test-%s' % short_uid()
         self.s3_client.create_bucket(Bucket=bucket_name)
-        object_key = 'test-key'
+        object_key = 'test-key-nonexistent'
         self.s3_client.put_object(Bucket=bucket_name, Key=object_key, Body='something')
         response = self.s3_client.delete_objects(Bucket=bucket_name,
             Delete={'Objects': [{'Key': object_key}, {'Key': 'dummy1'}, {'Key': 'dummy2'}]})
@@ -655,6 +677,71 @@ class S3ListenerTest(unittest.TestCase):
         self.assertEqual(response.status_code, 404)
         # cleanup
         self.s3_client.delete_bucket(Bucket=bucket_name)
+
+    def test_s3_event_notification_with_sqs(self):
+        key_by_path = 'aws/bucket=2020/test1.txt'
+
+        queue_url, queue_attributes = self._create_test_queue()
+        self._create_test_notification_bucket(queue_attributes)
+        self.s3_client.put_bucket_versioning(Bucket=TEST_BUCKET_WITH_NOTIFICATION,
+                                             VersioningConfiguration={'Status': 'Enabled'})
+
+        body = 'Lorem ipsum dolor sit amet, ... ' * 30
+
+        # put an object
+        self.s3_client.put_object(Bucket=TEST_BUCKET_WITH_NOTIFICATION, Key=key_by_path, Body=body)
+
+        self.assertEqual(self._get_test_queue_message_count(queue_url), '1')
+
+        rs = self.sqs_client.receive_message(QueueUrl=queue_url)
+        record = [json.loads(to_str(m['Body'])) for m in rs['Messages']][0]['Records'][0]
+
+        download_file = new_tmp_file()
+        self.s3_client.download_file(Bucket=TEST_BUCKET_WITH_NOTIFICATION,
+                                     Key=key_by_path, Filename=download_file)
+
+        self.assertEqual(record['s3']['object']['size'], os.path.getsize(download_file))
+
+        # clean up
+        self.s3_client.put_bucket_versioning(Bucket=TEST_BUCKET_WITH_NOTIFICATION,
+                                             VersioningConfiguration={'Status': 'Disabled'})
+
+        self.sqs_client.delete_queue(QueueUrl=queue_url)
+        self._delete_bucket(TEST_BUCKET_WITH_NOTIFICATION, [key_by_path])
+
+    def test_s3_delete_object_with_version_id(self):
+        test_1st_key = 'aws/s3/testkey1.txt'
+        test_2nd_key = 'aws/s3/testkey2.txt'
+
+        body = 'Lorem ipsum dolor sit amet, ... ' * 30
+
+        self.s3_client.create_bucket(Bucket=TEST_BUCKET_WITH_VERSIONING)
+        self.s3_client.put_bucket_versioning(Bucket=TEST_BUCKET_WITH_VERSIONING,
+                                             VersioningConfiguration={'Status': 'Enabled'})
+
+        # put 2 objects
+        rs = self.s3_client.put_object(Bucket=TEST_BUCKET_WITH_VERSIONING, Key=test_1st_key, Body=body)
+        self.s3_client.put_object(Bucket=TEST_BUCKET_WITH_VERSIONING, Key=test_2nd_key, Body=body)
+
+        version_id = rs['VersionId']
+
+        # delete 1st object with version
+        rs = self.s3_client.delete_objects(Bucket=TEST_BUCKET_WITH_VERSIONING,
+                                           Delete={'Objects': [{'Key': test_1st_key, 'VersionId': version_id}]})
+
+        deleted = rs['Deleted'][0]
+        self.assertEqual(deleted['Key'], test_1st_key)
+        self.assertEqual(deleted['VersionId'], version_id)
+
+        rs = self.s3_client.list_object_versions(Bucket=TEST_BUCKET_WITH_VERSIONING)
+        object_versions = [object['VersionId'] for object in rs['Versions']]
+
+        self.assertNotIn(version_id, object_versions)
+
+        # clean up
+        self.s3_client.put_bucket_versioning(Bucket=TEST_BUCKET_WITH_VERSIONING,
+                                             VersioningConfiguration={'Status': 'Disabled'})
+        self._delete_bucket(TEST_BUCKET_WITH_VERSIONING, [test_1st_key, test_2nd_key])
 
     # ---------------
     # HELPER METHODS

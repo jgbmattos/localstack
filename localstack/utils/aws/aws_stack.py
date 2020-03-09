@@ -238,6 +238,9 @@ class VelocityInput:
     def json(self, path):
         return json.dumps(self.path(path))
 
+    def __repr__(self):
+        return '$input'
+
 
 class VelocityUtil:
     """Simple class to mimick the behavior of variable '$util' in AWS API Gateway integration velocity templates.
@@ -260,6 +263,10 @@ class VelocityUtil:
 
 def render_velocity_template(template, context, variables={}, as_json=False):
     import airspeed
+
+    # run a few fixes to properly prepare the template
+    template = re.sub(r'(^|\n)#\s+set(.*)', r'\1#set\2', template, re.MULTILINE)
+
     t = airspeed.Template(template)
     var_map = {
         'input': VelocityInput(context),
@@ -364,6 +371,11 @@ def iam_resource_arn(resource, role=None, env=None):
 def get_iam_role(resource, env=None):
     env = get_environment(env)
     return 'role-%s' % resource
+
+
+def secretsmanager_secret_arn(secret_name, account_id=None, region_name=None):
+    pattern = 'arn:aws:secretsmanager:%s:%s:secret:%s'
+    return _resource_arn(secret_name, pattern, account_id=account_id, region_name=region_name)
 
 
 def cloudformation_stack_arn(stack_name, account_id=None, region_name=None):

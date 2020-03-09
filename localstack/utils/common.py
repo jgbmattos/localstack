@@ -27,7 +27,7 @@ import dns.resolver
 import functools
 from io import BytesIO
 from contextlib import closing
-from datetime import datetime
+from datetime import datetime, date
 from six import with_metaclass
 from six.moves import cStringIO as StringIO
 from six.moves.urllib.parse import urlparse
@@ -80,7 +80,7 @@ class CustomEncoder(json.JSONEncoder):
                 return float(o)
             else:
                 return int(o)
-        if isinstance(o, datetime):
+        if isinstance(o, (datetime, date)):
             return str(o)
         if isinstance(o, six.binary_type):
             return to_str(o)
@@ -428,6 +428,10 @@ def timestamp(time=None, format=TIMESTAMP_FORMAT):
     return time.strftime(format)
 
 
+def timestamp_millis(time=None):
+    return timestamp(time=time, format=TIMESTAMP_FORMAT_MILLIS)
+
+
 def retry(function, retries=3, sleep=1, sleep_before=0, **kwargs):
     raise_error = None
     if sleep_before > 0:
@@ -447,7 +451,7 @@ def dump_thread_info():
     print(run("ps aux | grep 'node\\|java\\|python'"))
 
 
-def merge_recursive(source, destination):
+def merge_recursive(source, destination, none_values=[None]):
     for key, value in source.items():
         if isinstance(value, dict):
             # get node or create one
@@ -457,7 +461,8 @@ def merge_recursive(source, destination):
             if not isinstance(destination, dict):
                 LOG.warning('Destination for merging %s=%s is not dict: %s' %
                     (key, value, destination))
-            destination[key] = value
+            if destination.get(key) in none_values:
+                destination[key] = value
     return destination
 
 
@@ -502,15 +507,18 @@ def obj_to_xml(obj):
     return str(obj)
 
 
-def now_utc():
-    return mktime(datetime.utcnow())
+def now_utc(millis=False):
+    return mktime(datetime.utcnow(), millis=millis)
 
 
-def now():
-    return mktime(datetime.now())
+def now(millis=False):
+    return mktime(datetime.now(), millis=millis)
 
 
-def mktime(timestamp):
+def mktime(timestamp, millis=False):
+    if millis:
+        epoch = datetime.utcfromtimestamp(0)
+        return (timestamp - epoch).total_seconds()
     return calendar.timegm(timestamp.timetuple())
 
 
@@ -637,6 +645,10 @@ def parse_chunked_data(data):
         chunks.append(data[:length])
         data = data[length:].strip()
     return ''.join(chunks)
+
+
+def first_char_to_lower(s):
+    return '%s%s' % (s[0].lower(), s[1:])
 
 
 def is_number(s):

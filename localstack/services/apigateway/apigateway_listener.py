@@ -204,7 +204,7 @@ def invoke_rest_api(api_id, stage, method, invocation_path, data, headers, path=
                 new_request = aws_stack.render_velocity_template(template, data) + '&QueueName=%s' % queue
                 headers = aws_stack.mock_aws_request_headers(service='sqs', region_name=region_name)
 
-                url = urljoin(TEST_SQS_URL, '%s/%s' % (account_id, queue))
+                url = urljoin(TEST_SQS_URL, 'queue/%s' % queue)
                 result = common.make_http_request(url, method='POST', headers=headers, data=new_request)
                 return result
 
@@ -253,7 +253,9 @@ def invoke_rest_api(api_id, stage, method, invocation_path, data, headers, path=
             parsed_result = common.json_safe(parsed_result)
             parsed_result = {} if parsed_result is None else parsed_result
             response.status_code = int(parsed_result.get('statusCode', 200))
-            response.headers.update(parsed_result.get('headers', {}))
+            parsed_headers = parsed_result.get('headers', {})
+            if parsed_headers is not None:
+                response.headers.update(parsed_headers)
             try:
                 if isinstance(parsed_result['body'], dict):
                     response._content = json.dumps(parsed_result['body'])
