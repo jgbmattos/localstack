@@ -2,7 +2,6 @@
 
 import json
 import unittest
-
 from botocore.exceptions import ClientError
 
 from localstack.config import external_service_url
